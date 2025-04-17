@@ -14,34 +14,36 @@
 # limitations under the License.
 
 from swift.common.swob import HTTPForbidden, HTTPBadRequest, wsgify
-from swift.common.utils import get_logger, split_path
+from swift.common.utils import get_logger, split_path, config_true_value, get_swift_info
 from swift.proxy.controllers.base import get_container_info, get_object_info
 from swift.common.request_helpers import get_sys_meta_prefix
 from swift.common.utils.timestamp import Timestamp
+from swift.common.middleware.versioned_writes.object_versioning import CLIENT_VERSIONS_ENABLED
 
 """
 Locks objects
 """
 
 DAY_OFFSET = 24 * 60 * 60
-YEAR_OFFSET = DAY_OFFSET * 365.25  # TODO: Better leap year handling?
+YEAR_OFFSET = DAY_OFFSET * 365
 
-LOCK_ENABLED = 'Enabled'
-LOCK_MODE = 'Mode'
-LOCK_DAYS = 'Days'
-LOCK_YEARS = 'Years'
-LOCK_UNTIL = 'LockedUntil'
+LOCK_ENABLED = 'enabled'
+LOCK_MODE = 'mode'
+LOCK_DAYS = 'days'
+LOCK_YEARS = 'years'
+LOCK_LEGAL = 'legalhold'
+LOCK_UNTIL = 'lockeduntil'
 
 
-def usr_header(name, for_obj=False):
-    obj_type = 'Object' if for_obj else 'Container'
+def usr_header(name, obj=False):
+    obj_type = 'Object' if obj else 'Container'
     return f'X-{obj_type}-Lock-{name}'
 
 
-def sys_header(name, for_obj=False):
-    sys_prefix = get_sys_meta_prefix('object') if for_obj \
+def sys_header(name, obj=False):
+    sys_prefix = get_sys_meta_prefix('object') if obj \
         else get_sys_meta_prefix('container')
-    return f'{sys_prefix}-Lock-{name}'
+    return f'{sys_prefix}lock-{name.lower()}'
 
 
 def parse_duration(duration):
@@ -52,113 +54,81 @@ def parse_duration(duration):
 
     :returns: the parsed duration
     """
-    if duration == "":
+    if duration == '':
         return 0
     duration_num = 0
     try:
         duration_num = int(duration)
     except ValueError:
-        raise ValueError(
+        raise HTTPBadRequest(
             f'''{duration} is not a valid lock duration,
             must be a positive integer.'''
         )
     if duration_num < 0:
-        raise ValueError("Lock duration cannot be negative")
+        raise HTTPBadRequest("Lock duration cannot be negative")
     return duration_num
 
 
-class LockSettings(object):
-    def __init__(self, enabled, mode, days, years, store_days,
-                 store_years, until, locked_obj):
-        types_valid = (
-            isinstance(enabled, str)
-            and isinstance(mode, str)
-            and isinstance(days, str)
-            and isinstance(years, str)
-            and isinstance(store_days, str)
-            and isinstance(store_years, str)
-            and isinstance(until, str)
-            and isinstance(locked_obj, str)
+def get_lock_duration(days_str, years_str):
+    days = parse_duration(days_str)
+    years = parse_duration(years_str)
+    if days > 0 and years > 0:
+        raise HTTPBadRequest('Cannot set both Days and Years lock duration.')
+    if days > 0:
+        return (days, LOCK_DAYS)
+    if years > 0:
+        return (years, LOCK_YEARS)
+
+    return (0, None)
+
+
+def validate_mode(mode):
+    if mode is None:
+        return None
+
+    m = mode.lower()
+    if m == 'governance' or m == 'compliance':
+        return m
+    else:
+        raise HTTPBadRequest(
+            f'''Value of Lock Mode header is invalid, must
+            be Governance or Compliance if present, was "{mode}".'''
         )
-        if not types_valid:
-            raise Exception(
-                'Invalid lock settings input, this should never happen')
 
-        self.locked_obj = locked_obj
 
-        if enabled == 'Enabled':
-            self.enabled = 'Enabled'
-        elif enabled == '':
-            # If object locking is disabled we default all relevent settings
-            # and return early. We can't warn the user if they try and set
-            # other settings, but we can't do that anyway
-            self.enabled = ''
-            self.mode = ''
-            self.days = ''
-            self.years = ''
-            return
-        else:
-            raise ValueError(
-                f'''Value of X-{locked_obj}-Lock-Enabled header is invalid,
-                  must be Enabled or empty string, was "{enabled}".'''
-            )
+def is_container_lock_enabled(headers, container_meta):
+    currently_enabled = config_true_value(container_meta.get(LOCK_ENABLED))
+    user_enabled = config_true_value(headers.get(usr_header(LOCK_ENABLED)))
 
-        if mode == 'Governance' or mode == 'Compliance':
-            self.mode = mode
-        else:
-            raise ValueError(
-                f'''Value of X-{locked_obj}-Lock-Mode header is invalid, must
-                be Governance or Compliance, was "{mode}".'''
-            )
+    if currently_enabled and not user_enabled:
+        raise HTTPBadRequest(
+            'Cannot disable container locking once enabled')
 
-        # If we haven't been given a new duration, we use the old one as long
-        # as it exists. We assume it's valid here because we must have
-        # checked it in the past (barring admin nonsense, their fault for now)
-        num_days = parse_duration(days)
-        num_years = parse_duration(years)
+    if not currently_enabled:
+        currently_enabled = user_enabled
 
-        if not num_days and not num_years and (store_days or store_years):
-            self.days = store_days
-            self.years = store_years
-        elif num_days and num_years:
-            raise ValueError(
-                f'''Cannot set both X-{locked_obj}-Lock-Days and
-                X-{locked_obj}-Lock-Years headers, consider using only days.'''
-            )
-        elif num_days:
-            self.days = str(num_days)
-            self.years = ''
-        elif num_years:
-            self.days = ''
-            self.years = str(num_years)
-        else:
-            raise ValueError(
-                f'''No lock duration, set one of X-{locked_obj}-Lock-Days
-                or X-{locked_obj}-Lock-Years headers.'''
-            )
+    return currently_enabled
 
-    def update_headers(self, req):
-        # There is no scenario where we want to write headers if locking is off
-        if not self.enabled:
-            return
 
-        for_obj = self.locked_obj == 'Object'
-        vals = [(self.enabled, LOCK_ENABLED), (self.mode, LOCK_MODE),
-                (self.days, LOCK_DAYS), (self.years, LOCK_YEARS)]
+def write_sys_headers(r, enabled, mode, time_type, lock_duration, obj):
+    if not enabled:
+        return
 
-        for val, header in vals:
-            if not val:
-                continue
+    r.headers[CLIENT_VERSIONS_ENABLED] = 'true'
+    r.headers[sys_header(LOCK_ENABLED, obj=obj)] = 'true'
 
-            req.headers[usr_header(header, for_obj)] = val
-            req.headers[sys_header(header, for_obj)] = val
+    r.headers[sys_header(LOCK_MODE, obj=obj)] = mode
 
-    def unlock_timestamp(self):
-        offset = (
-            int(self.days) *
-            DAY_OFFSET if self.days else int(self.years) * YEAR_OFFSET
-        )
-        return Timestamp(Timestamp.now().timestamp + offset)
+    if time_type:
+        r.headers[sys_header(time_type, obj=obj)] = lock_duration
+
+
+def write_usr_headers(r):
+    for h in [LOCK_ENABLED, LOCK_MODE, LOCK_DAYS, LOCK_YEARS, LOCK_UNTIL]:
+        for obj in [True, False]:
+            if sys_header(h, obj=obj) in r.headers:
+                r.headers[usr_header(h, obj=obj)
+                          ] = r.headers[sys_header(h, obj=obj)]
 
 
 class ObjectLockingMiddleware(object):
@@ -172,38 +142,107 @@ class ObjectLockingMiddleware(object):
 
         container_info = get_container_info(
             req.environ, self.app, swift_source='OL')
+
+        container_meta = container_info['sysmeta']
+        locked = is_container_lock_enabled(req.headers, container_meta)
+
+        # If lock isn't enabled for the container we don't need to do anything
+        if not locked:
+            return req.get_response(self.app)
+
+        user_groups = (req.remote_user or '').split(',')
+        account_user = user_groups[1] if len(user_groups) > 1 else None
+
+        def_lock_mode = validate_mode(req.headers.get(usr_header(LOCK_MODE)))
+        if def_lock_mode is None:
+            if LOCK_MODE in container_meta:
+                def_lock_mode = container_meta.get(LOCK_MODE)
+
+        def_lock_duration, def_time_type = get_lock_duration(req.headers.get(usr_header(
+            LOCK_DAYS), ''), req.headers.get(usr_header(LOCK_YEARS), ''))
+        if def_time_type is None:
+            def_lock_duration, def_time_type = get_lock_duration(
+                container_meta.get(LOCK_DAYS, ''), container_meta.get(LOCK_YEARS, ''))
+
+        if (def_lock_mode is None) != (def_time_type is None):
+            raise HTTPBadRequest(
+                'Must set both default lock mode and duration.')
+
+        container_has_defaults = def_lock_mode is not None
+
+        # Because containers must be empty to be deleted, there are no
+        # non-object API calls that we will fail. Just add sysmeta to response
+        if obj is None:
+            if req.method in ('POST', 'PUT', 'COPY'):
+                write_sys_headers(req, locked, def_lock_mode, def_time_type,
+                                  def_lock_duration, obj=False)
+
+            resp = req.get_response(self.app)
+
+            write_usr_headers(resp)
+
+            return resp
+
         # Because COPY requests need to check if the destination is locked
         # we can't use the request's path here, so we construct our own
         obj_info = get_object_info(
-            self.app, req.environ, f'/{version}/{account}/{container}/{obj}'
+            req.environ, self.app, path=f'/{version}/{account}/{container}/{obj}', swift_source='OL'
         )
+        obj_meta = obj_info.get('sysmeta', {})
 
-        # TODO: Catch value err here
-        try:
-            container_cfg = self.verify_and_update_container_lock(
-                req, container_info
-            )
-        except ValueError as e:
-            return HTTPBadRequest(body=e.args[0])
+        is_locked = obj_meta.get(LOCK_UNTIL) is not None
 
-        container_cfg.update_headers(req)
+        obj_lock_enabled = req.headers.get(usr_header(LOCK_ENABLED, obj=True))
+        if obj_lock_enabled is None:
+            if LOCK_ENABLED in obj_meta:
+                obj_lock_enabled = obj_meta[LOCK_ENABLED]
 
-        # TODO: Bucket settings
+        obj_lock_mode = validate_mode(
+            req.headers.get(usr_header(LOCK_MODE, obj=True)))
+        if obj_lock_mode is None:
+            if LOCK_MODE in obj_meta:
+                obj_lock_mode = obj_meta.get(LOCK_MODE)
 
-        if req.method in ('PUT', 'POST', 'DELETE'):
-            if obj_info:
-                locked_until = obj_info['sysmeta'] \
-                    .get(sys_header(LOCK_UNTIL, for_obj=True))
+        obj_lock_duration, obj_time_type = get_lock_duration(req.headers.get(usr_header(
+            LOCK_DAYS, obj=True), ''), req.headers.get(usr_header(LOCK_YEARS, obj=True), ''))
+        if obj_time_type is None:
+            obj_lock_duration, obj_time_type = get_lock_duration(obj_meta.get(
+                LOCK_DAYS, ''), obj_meta.get(LOCK_YEARS, ''))
 
-                if Timestamp.now() < Timestamp(locked_until):
-                    return HTTPForbidden(
-                        body='You specifically told us not to let you do this.'
-                    )  # TODO: Handle modes
-            else:
-                req[sys_header(LOCK_UNTIL)] = \
-                    container_cfg.unlock_timestamp()
+        lock_mode = (obj_lock_mode if obj_lock_mode else def_lock_mode)
+        lock_duration, time_type = ((obj_lock_duration, obj_time_type) if obj_time_type else (
+            def_lock_duration, def_time_type))
+
+        if (lock_mode is None) != (time_type is None):
+            raise HTTPBadRequest('Must set both object lock mode and duration.')
+
+        should_lock_obj = lock_mode is not None or container_has_defaults
+
+        versioned_req = req.params.get('version-id') is not None
+
+        if versioned_req and req.method == 'DELETE':
+            obj_lock_enabled = obj_meta.get(LOCK_ENABLED)
+            locked_until = obj_meta.get(LOCK_UNTIL, 0.0)
+            if obj_lock_enabled and Timestamp.now() < Timestamp(locked_until):
+                raise HTTPBadRequest(
+                    'You specifically told us not to let you do this.'
+                )  # TODO: Handle modes
+
+        if not versioned_req and req.method in ('POST', 'PUT', 'COPY') and should_lock_obj:
+            offset = def_lock_duration * \
+                (DAY_OFFSET if def_time_type == LOCK_DAYS else YEAR_OFFSET)
+            unlock_ts = Timestamp(Timestamp.now().timestamp + offset)
+            req.headers[sys_header(LOCK_UNTIL, obj=True)] = unlock_ts.isoformat
+
+        write_sys_headers(req, locked, def_lock_mode, def_time_type,
+                          def_lock_duration, obj=False)
+        write_sys_headers(req, should_lock_obj, lock_mode,
+                          time_type, lock_duration, obj=True)
 
         resp = req.get_response(self.app)
+
+        write_usr_headers(resp)
+
         return resp
 
     def get_dest_details(self, req):
@@ -221,37 +260,14 @@ class ObjectLockingMiddleware(object):
         except ValueError:
             return (None, None, None, None)
 
-    def get_container_lock_settings(self, req, container_info):
-        enabled = container_info['sysmeta'].get(sys_header(LOCK_ENABLED), '')
-
-        if not enabled:
-            enabled = req.headers.get(usr_header(LOCK_ENABLED), '')
-
-        container_mode = container_mode = req.headers.get(
-            usr_header(LOCK_MODE),
-            container_info['sysmeta'].get(sys_header(LOCK_MODE), ''),
-        )
-        days = req.headers.get(usr_header(LOCK_DAYS), '')
-        years = req.headers.get(usr_header(LOCK_YEARS), '')
-        store_days = container_info['sysmeta'].get(sys_header(LOCK_DAYS), '')
-        store_years = container_info['sysmeta'].get(sys_header(LOCK_YEARS), '')
-
-        return LockSettings(
-            enabled,
-            container_mode,
-            days,
-            years,
-            store_days,
-            store_years,
-            'Container',
-        )
-
 
 def filter_factory(global_conf, **local_conf):
     conf = global_conf.copy()
     conf.update(local_conf)
 
     def object_locking_filter(app):
+        if 'object_versioning' not in get_swift_info():
+            raise ValueError('object locking requires object_versioning')
         return ObjectLockingMiddleware(app, conf)
 
     return object_locking_filter
