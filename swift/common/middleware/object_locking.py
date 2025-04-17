@@ -139,6 +139,8 @@ class ObjectLockingMiddleware(object):
     @wsgify
     def __call__(self, req):
         version, account, container, obj = self.get_dest_details(req)
+        if container is None:
+            return req.get_response(self.app)
 
         container_info = get_container_info(
             req.environ, self.app, swift_source='OL')
